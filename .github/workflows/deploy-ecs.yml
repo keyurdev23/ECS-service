@@ -22,6 +22,7 @@ env:
   ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
   ECS_SERVICE: ${{ vars.ECS_SERVICE }}
   CONTAINER_NAME: ${{ vars.ECS_CONTAINER_NAME }}
+  ECS_TASK_DEFINITION: ${{ vars.ECS_TASK_DEFINITION }}
 
 jobs:
   build-push-deploy:
@@ -94,27 +95,17 @@ jobs:
           docker logs ecs-demo-smoke
           exit 1
 
-      # 8. Read the task definition already used by the demo ECS service.
-      # This avoids maintaining a second task-definition JSON file in the repo.
+      # 8. Read the current task definition directly.
       - name: Download current ECS task definition
         env:
           TASK_DEFINITION_FILE: current-task-definition.json
         run: |
-          TASK_DEFINITION_ARN=$(aws ecs describe-services \
-            --cluster "$ECS_CLUSTER" \
-            --services "$ECS_SERVICE" \
-            --query 'services[0].taskDefinition' \
-            --output text)
-
-          if [ -z "$TASK_DEFINITION_ARN" ] || [ "$TASK_DEFINITION_ARN" = "None" ]; then
-            echo "Could not find the task definition used by the ECS service."
-            exit 1
-          fi
-
+          echo "Fetching task definition: $ECS_TASK_DEFINITION"
           aws ecs describe-task-definition \
-            --task-definition "$TASK_DEFINITION_ARN" \
+            --task-definition "$ECS_TASK_DEFINITION" \
             --query taskDefinition \
             --output json > "$TASK_DEFINITION_FILE"
+          echo "Successfully downloaded task definition."
 
       # 9. Replace only the selected container's image with the new SHA tag.
       - name: Render new ECS task definition
