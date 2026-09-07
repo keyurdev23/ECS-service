@@ -1,0 +1,137 @@
+name: Build and deploy demo to Amazon ECS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# OIDC needs id-token: write. Checkout needs contents: read.
+permissions:
+  id-token: write
+  contents: read
+
+# Do not allow two deployments to update the ECS service simultaneously.
+concurrency:
+  group: demo-ecs-deployment
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+  CONTAINER_NAME: ${{ vars.ECS_CONTAINER_NAME }}
+
+jobs:
+  build-push-deploy:
+    name: Build, push to ECR, and deploy to ECS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # 1. Get the Dockerfile and repository source.
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      # 2. Get temporary AWS credentials through GitHub OIDC.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-demo-ecs
+
+      # 3. Authenticate Docker with your private ECR registry.
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 4. Create the immutable ECR image URI for this commit.
+      - name: Set image URI
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "uri=$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "latest_uri=$ECR_REGISTRY/$ECR_REPOSITORY:latest" >> "$GITHUB_OUTPUT"
+
+      # 5. Enable Docker BuildKit and layer caching.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 6. Build ./Dockerfile and push commit + latest tags to ECR.
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image.outputs.uri }}
+            ${{ steps.image.outputs.latest_uri }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 7. Smoke-test the pushed image before changing the ECS service.
+      - name: Smoke-test Docker image
+        run: |
+          docker pull "${{ steps.image.outputs.uri }}"
+          docker run --detach --name ecs-demo-smoke --publish 8080:80 \
+            "${{ steps.image.outputs.uri }}"
+
+          trap 'docker rm --force ecs-demo-smoke >/dev/null 2>&1 || true' EXIT
+
+          for attempt in {1..10}; do
+            if curl --fail --silent --show-error http://localhost:8080/ >/dev/null; then
+              echo "Container smoke test passed."
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Container did not return a successful HTTP response."
+          docker logs ecs-demo-smoke
+          exit 1
+
+      # 8. Read the task definition already used by the demo ECS service.
+      # This avoids maintaining a second task-definition JSON file in the repo.
+      - name: Download current ECS task definition
+        env:
+          TASK_DEFINITION_FILE: current-task-definition.json
+        run: |
+          TASK_DEFINITION_ARN=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          if [ -z "$TASK_DEFINITION_ARN" ] || [ "$TASK_DEFINITION_ARN" = "None" ]; then
+            echo "Could not find the task definition used by the ECS service."
+            exit 1
+          fi
+
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_DEFINITION_ARN" \
+            --query taskDefinition \
+            --output json > "$TASK_DEFINITION_FILE"
+
+      # 9. Replace only the selected container's image with the new SHA tag.
+      - name: Render new ECS task definition
+        id: render-task-definition
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: current-task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.image.outputs.uri }}
+
+      # 10. Register a new task-definition revision and update the Fargate service.
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-definition.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+          force-new-deployment: true
