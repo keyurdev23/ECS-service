@@ -34,13 +34,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      # 2. Get temporary AWS credentials through GitHub OIDC.
+      # 2. Configure AWS credentials using Access Key & Secret Key.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: github-actions-demo-ecs
 
       # 3. Authenticate Docker with your private ECR registry.
       - name: Log in to Amazon ECR
